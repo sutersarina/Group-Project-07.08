@@ -8,3 +8,5 @@ even_list = return_even(original_list)
 st.write('Hello world')
 
 st.write('Hello world again')
+
+st.write(even_list)
