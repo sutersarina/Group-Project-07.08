@@ -1,21 +1,22 @@
-import streamlit as st
 from Feature_01 import return_even
 from Feature_02 import return_odd
 
-original_list = [i for i in range(10)]
-                 
-even_list = return_even(original_list)
 
-odd_list = return_odd(original_list)
+def build_lists(values):
+    return return_even(values), return_odd(values)
 
-st.write("Hello world")
 
-st.write("Hello world again")
+if __name__ == "__main__":
+    import streamlit as st
 
-st.write(even_list)
+    original_list = list(range(10))
+    even_list, odd_list = build_lists(original_list)
 
-st.write(odd_list)
+    st.write("Hello world")
+    st.write("Hello world again")
+    st.write(even_list)
+    st.write(odd_list)
 
-print("Hello Guys")
+    print("Hello Guys")
 
 
