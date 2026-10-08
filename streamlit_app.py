@@ -52,6 +52,17 @@ with st.spinner("Lade Inserate ..."):
     df, stand = lade_daten()
 
 st.caption(f"Datenstand: {stand}")
+rolle = st.radio("Ich bin ...", ["Mieter/in", "Vermieter/in"], horizontal=True)
+
+with st.sidebar:
+    st.header("Deine Wohnung")
+    gemeinde = st.selectbox("Gemeinde", sorted(df["gemeinde"].dropna().unique()))
+    flaeche = st.number_input("Wohnfläche (m²)", min_value=15, max_value=300, value=70)
+    zimmer = st.select_slider("Zimmer", [1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5, 5, 5.5, 6], value=3.5)
+    baujahr = st.number_input("Baujahr", min_value=1850, max_value=2026, value=1990)
+    if rolle == "Mieter/in":
+        meine_miete = st.number_input("Deine Nettomiete (CHF)", min_value=0, max_value=10000, value=1500)
+    pruefen = st.button("Miete prüfen")
 
 if df.empty:
     st.warning("Keine Inserate im Kanton St. Gallen gefunden.")
