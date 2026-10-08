@@ -1,29 +1,29 @@
 """
 Streamlit-Version: Holt alle Miet-Inserate von Flatfox im Kanton St. Gallen,
 zeigt sie als Tabelle an und bietet sie als Excel-Download an.
-
+ 
 Lokal starten:      streamlit run streamlit_app.py
 Streamlit Cloud:    diese Datei + requirements.txt ins GitHub-Repo legen
 """
-
+ 
 import io
 import time
 from datetime import date
-
+ 
 import pandas as pd
 import requests
 import streamlit as st
-
+ 
 FLATFOX_URL = "https://flatfox.ch/api/v1/public-listing/"
 PLZ_URL = "https://openplzapi.org/ch/Cantons/17/Localities"  # 17 = Kanton St. Gallen
-
+ 
 # Diese Ausstattungsmerkmale werden zu eigenen Ja/Nein-Spalten
 MERKMALE = [
     "balconygarden", "lift", "washingmachine", "tumbler", "dishwasher",
     "view", "parkingspace", "garage", "fireplace", "petsallowed",
 ]
-
-
+ 
+ 
 def lade_sg_postleitzahlen():
     """Holt alle Postleitzahlen im Kanton SG mit Gemeinde und Wahlkreis."""
     plz = {}
@@ -41,8 +41,8 @@ def lade_sg_postleitzahlen():
             }
         seite += 1
     return plz
-
-
+ 
+ 
 def lade_flatfox_inserate(fortschritt):
     """Holt alle Inserate der Schweiz, Seite für Seite (die API kann nicht nach Kanton filtern)."""
     inserate = []
@@ -61,16 +61,16 @@ def lade_flatfox_inserate(fortschritt):
         params = None        # steckt ab jetzt schon im "next"-Link
         time.sleep(0.5)      # Server nicht überlasten
     return inserate
-
-
+ 
+ 
 def merkmal_namen(attributes):
     """Ausstattung kann als Liste von Texten oder von {"name": ...} kommen."""
     namen = set()
     for a in attributes or []:
         namen.add(a["name"] if isinstance(a, dict) else a)
     return namen
-
-
+ 
+ 
 def baue_tabelle(alle, sg_plz):
     zeilen = []
     for i in alle:
@@ -81,7 +81,7 @@ def baue_tabelle(alle, sg_plz):
             continue
         if i.get("zipcode") is None or int(i["zipcode"]) not in sg_plz:
             continue
-
+ 
         ort = sg_plz[int(i["zipcode"])]
         ausstattung = merkmal_namen(i.get("attributes"))
         zeile = {
@@ -109,24 +109,24 @@ def baue_tabelle(alle, sg_plz):
         for m in MERKMALE:
             zeile[m] = m in ausstattung
         zeilen.append(zeile)
-
+ 
     df = pd.DataFrame(zeilen)
     if not df.empty:
         # Miete pro m² (netto), nur wo beides vorhanden ist
         df["miete_pro_m2"] = (df["miete_netto"] / df["flaeche_m2"]).round(2)
     return df
-
-
+ 
+ 
 st.title("Flatfox-Inserate Kanton St. Gallen")
 st.write("Lädt alle aktuellen Mietinserate von Flatfox im Kanton St. Gallen.")
-
+ 
 if st.button("Daten laden"):
     with st.spinner("Lade Postleitzahlen ..."):
         sg_plz = lade_sg_postleitzahlen()
     fortschritt = st.progress(0.0, text="Lade Inserate ...")
     alle = lade_flatfox_inserate(fortschritt)
     st.session_state["df"] = baue_tabelle(alle, sg_plz)
-
+ 
 if "df" in st.session_state:
     df = st.session_state["df"]
     if df.empty:
@@ -136,14 +136,24 @@ if "df" in st.session_state:
         spalte1.metric("Inserate", len(df))
         spalte2.metric("mit Nettomiete und Fläche", int(df["miete_pro_m2"].notna().sum()))
         spalte3.metric("Median CHF/m²", df["miete_pro_m2"].median())
-
+ 
         st.dataframe(df)
-
-        puffer = io.BytesIO()
-        df.to_excel(puffer, index=False)
+ 
+        # CSV geht immer und lässt sich auch in Excel öffnen
         st.download_button(
-            "Als Excel herunterladen",
-            data=puffer.getvalue(),
-            file_name=f"flatfox_sg_{date.today().isoformat()}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "Als CSV herunterladen (öffnet in Excel)",
+            data=df.to_csv(index=False, sep=";").encode("utf-8-sig"),
+            file_name=f"flatfox_sg_{date.today().isoformat()}.csv",
+            mime="text/csv",
         )
+        try:
+            puffer = io.BytesIO()
+            df.to_excel(puffer, index=False)
+            st.download_button(
+                "Als Excel herunterladen",
+                data=puffer.getvalue(),
+                file_name=f"flatfox_sg_{date.today().isoformat()}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        except ImportError:
+            st.info("Für den Excel-Download fehlt das Paket openpyxl: im Terminal `pip install openpyxl` ausführen.")
