@@ -11,14 +11,18 @@ Wird täglich automatisch von GitHub Actions gestartet
     python sammeln.py
 """
 
+import json
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 
 import pandas as pd
 import requests
 
-ARCHIV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "archiv.csv")
+ORDNER = os.path.dirname(os.path.abspath(__file__))
+ARCHIV = os.path.join(ORDNER, "archiv.csv")
+KANTONSGRENZE = os.path.join(ORDNER, "kanton_sg.geojson")
 AUFBEWAHREN_TAGE = 365  # 12 Monate
 
 FLATFOX_URL = "https://flatfox.ch/api/v1/public-listing/"
@@ -34,7 +38,11 @@ MERKMALE = [
 
 
 def lade_sg_postleitzahlen():
-    """Holt alle Postleitzahlen im Kanton SG mit Gemeinde und Wahlkreis."""
+    """Holt alle Ortschaften im Kanton SG mit Gemeinde und Wahlkreis.
+
+    Eine Postleitzahl kann zu mehreren Ortschaften gehören (z.B. 9500 Wil),
+    darum gibt es pro Postleitzahl eine Liste.
+    """
     plz = {}
     seite = 1
     while True:
@@ -44,12 +52,56 @@ def lade_sg_postleitzahlen():
         if not eintraege:
             break
         for e in eintraege:
-            plz[int(e["postalCode"])] = {
+            plz.setdefault(int(e["postalCode"]), []).append({
+                "ortschaft": e.get("name", ""),
                 "gemeinde": e["commune"]["name"],
                 "wahlkreis": e["district"]["shortName"],
-            }
+            })
         seite += 1
     return plz
+
+
+def vereinfache(name):
+    """'Gossau SG' -> 'gossau', 'Zuzwil (SG)' -> 'zuzwil', 'st. Gallen' -> 'st. gallen'"""
+    name = re.sub(r"\(.*?\)", "", str(name or "")).lower()
+    return re.sub(r"\s+(sg|zh|tg|ar|ai|gr|gl|sz)$", "", name.strip()).strip()
+
+
+def finde_ort(ortschaften, stadt):
+    """Wählt bei mehreren Ortschaften pro Postleitzahl die passende aus (über den Ortsnamen)."""
+    stadt = vereinfache(stadt)
+    for o in ortschaften:
+        if vereinfache(o["ortschaft"]) == stadt or vereinfache(o["gemeinde"]) == stadt:
+            return o
+    return ortschaften[0]
+
+
+def lade_kantonsgrenze():
+    """Liest die Umrisse des Kantons SG (Liste von Polygonen; das erste Ringstück ist
+    der Rand, weitere sind Löcher, z.B. die Kantone Appenzell)."""
+    with open(KANTONSGRENZE, encoding="utf-8") as f:
+        return json.load(f)["geometry"]["coordinates"]
+
+
+def punkt_im_ring(lon, lat, ring):
+    """Strahl-Methode: zählt, wie oft eine Linie vom Punkt nach rechts den Rand schneidet."""
+    drin = False
+    j = len(ring) - 1
+    for i in range(len(ring)):
+        xi, yi = ring[i]
+        xj, yj = ring[j]
+        if (yi > lat) != (yj > lat) and lon < (xj - xi) * (lat - yi) / (yj - yi) + xi:
+            drin = not drin
+        j = i
+    return drin
+
+
+def liegt_im_kanton(lon, lat, grenze):
+    for polygon in grenze:
+        rand, loecher = polygon[0], polygon[1:]
+        if punkt_im_ring(lon, lat, rand) and not any(punkt_im_ring(lon, lat, l) for l in loecher):
+            return True
+    return False
 
 
 def lade_seite(offset):
@@ -82,6 +134,7 @@ def merkmal_namen(attributes):
 
 def baue_tabelle(alle, sg_plz):
     """Macht aus den Flatfox-Daten eine Tabelle, nur Mietwohnungen und Häuser im Kanton SG."""
+    grenze = lade_kantonsgrenze()
     zeilen = []
     for i in alle:
         if i.get("offer_type") != "RENT":
@@ -90,8 +143,13 @@ def baue_tabelle(alle, sg_plz):
             continue
         if i.get("zipcode") is None or int(i["zipcode"]) not in sg_plz:
             continue
+        # Manche Postleitzahlen gelten über die Kantonsgrenze hinweg (z.B. 8630 Rüti ZH),
+        # darum zusätzlich prüfen, ob die Wohnung wirklich im Kanton SG liegt
+        if i.get("latitude") and i.get("longitude"):
+            if not liegt_im_kanton(i["longitude"], i["latitude"], grenze):
+                continue
 
-        ort = sg_plz[int(i["zipcode"])]
+        ort = finde_ort(sg_plz[int(i["zipcode"])], i.get("city"))
         ausstattung = merkmal_namen(i.get("attributes"))
         zeile = {
             "id": i.get("pk"),
@@ -165,6 +223,14 @@ def aktualisiere_archiv(archiv, heute_df, heute):
 def main():
     heute = date.today().isoformat()
     archiv = pd.read_csv(ARCHIV) if os.path.exists(ARCHIV) else pd.DataFrame()
+    if not archiv.empty:
+        # Wohnungen ausserhalb des Kantons entfernen, die früher ins Archiv gerutscht sind
+        grenze = lade_kantonsgrenze()
+        im_kanton = [
+            pd.isna(lat) or pd.isna(lon) or liegt_im_kanton(lon, lat, grenze)
+            for lat, lon in zip(archiv["lat"], archiv["lon"])
+        ]
+        archiv = archiv[im_kanton]
     vorher = len(archiv)
 
     print("Lade Inserate von Flatfox ...")
