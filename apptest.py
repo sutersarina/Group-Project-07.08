@@ -1,21 +1,18 @@
 """
-Holt alle Miet-Inserate von Flatfox im Kanton St. Gallen und speichert sie
-als Excel-Tabelle.
+Streamlit-Version: Holt alle Miet-Inserate von Flatfox im Kanton St. Gallen,
+zeigt sie als Tabelle an und bietet sie als Excel-Download an.
 
-Benötigt: Python 3 und die Pakete requests, pandas, openpyxl
-    pip install requests pandas openpyxl
-
-Starten:
-    python flatfox_sg.py
-
-Ergebnis: Datei "flatfox_sg_<datum>.xlsx" im selben Ordner.
+Lokal starten:      streamlit run streamlit_app.py
+Streamlit Cloud:    diese Datei + requirements.txt ins GitHub-Repo legen
 """
 
+import io
 import time
 from datetime import date
 
 import pandas as pd
 import requests
+import streamlit as st
 
 FLATFOX_URL = "https://flatfox.ch/api/v1/public-listing/"
 PLZ_URL = "https://openplzapi.org/ch/Cantons/17/Localities"  # 17 = Kanton St. Gallen
@@ -43,11 +40,10 @@ def lade_sg_postleitzahlen():
                 "wahlkreis": e["district"]["shortName"],
             }
         seite += 1
-    print(f"{len(plz)} Postleitzahlen im Kanton St. Gallen geladen.")
     return plz
 
 
-def lade_flatfox_inserate():
+def lade_flatfox_inserate(fortschritt):
     """Holt alle Inserate der Schweiz, Seite für Seite (die API kann nicht nach Kanton filtern)."""
     inserate = []
     url = FLATFOX_URL
@@ -57,7 +53,10 @@ def lade_flatfox_inserate():
         antwort.raise_for_status()
         daten = antwort.json()
         inserate.extend(daten["results"])
-        print(f"  {len(inserate)} von {daten['count']} Inseraten geladen ...")
+        fortschritt.progress(
+            min(len(inserate) / max(daten["count"], 1), 1.0),
+            text=f"{len(inserate)} von {daten['count']} Inseraten geladen ...",
+        )
         url = daten["next"]  # Link zur nächsten Seite, None auf der letzten Seite
         params = None        # steckt ab jetzt schon im "next"-Link
         time.sleep(0.5)      # Server nicht überlasten
@@ -72,11 +71,7 @@ def merkmal_namen(attributes):
     return namen
 
 
-def main():
-    sg_plz = lade_sg_postleitzahlen()
-    print("Lade Inserate von Flatfox (das dauert ein paar Minuten) ...")
-    alle = lade_flatfox_inserate()
-
+def baue_tabelle(alle, sg_plz):
     zeilen = []
     for i in alle:
         # Nur Mietwohnungen und Häuser im Kanton SG
@@ -116,23 +111,39 @@ def main():
         zeilen.append(zeile)
 
     df = pd.DataFrame(zeilen)
+    if not df.empty:
+        # Miete pro m² (netto), nur wo beides vorhanden ist
+        df["miete_pro_m2"] = (df["miete_netto"] / df["flaeche_m2"]).round(2)
+    return df
+
+
+st.title("Flatfox-Inserate Kanton St. Gallen")
+st.write("Lädt alle aktuellen Mietinserate von Flatfox im Kanton St. Gallen.")
+
+if st.button("Daten laden"):
+    with st.spinner("Lade Postleitzahlen ..."):
+        sg_plz = lade_sg_postleitzahlen()
+    fortschritt = st.progress(0.0, text="Lade Inserate ...")
+    alle = lade_flatfox_inserate(fortschritt)
+    st.session_state["df"] = baue_tabelle(alle, sg_plz)
+
+if "df" in st.session_state:
+    df = st.session_state["df"]
     if df.empty:
-        print("Keine Inserate im Kanton St. Gallen gefunden.")
-        return
+        st.warning("Keine Inserate im Kanton St. Gallen gefunden.")
+    else:
+        spalte1, spalte2, spalte3 = st.columns(3)
+        spalte1.metric("Inserate", len(df))
+        spalte2.metric("mit Nettomiete und Fläche", int(df["miete_pro_m2"].notna().sum()))
+        spalte3.metric("Median CHF/m²", df["miete_pro_m2"].median())
 
-    # Miete pro m² (netto) als zusätzliche Spalte, nur wo beides vorhanden ist
-    df["miete_pro_m2"] = (df["miete_netto"] / df["flaeche_m2"]).round(2)
+        st.dataframe(df)
 
-    datei = f"flatfox_sg_{date.today().isoformat()}.xlsx"
-    df.to_excel(datei, index=False)
-
-    print()
-    print(f"{len(df)} Inserate im Kanton St. Gallen gespeichert in {datei}")
-    print(f"  davon mit Nettomiete:      {df['miete_netto'].notna().sum()}")
-    print(f"  davon mit Fläche:          {df['flaeche_m2'].notna().sum()}")
-    print(f"  davon mit Baujahr:         {df['baujahr'].notna().sum()}")
-    print(f"  Median Nettomiete pro m²:  {df['miete_pro_m2'].median()} CHF")
-
-
-if __name__ == "__main__":
-    main()
+        puffer = io.BytesIO()
+        df.to_excel(puffer, index=False)
+        st.download_button(
+            "Als Excel herunterladen",
+            data=puffer.getvalue(),
+            file_name=f"flatfox_sg_{date.today().isoformat()}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
