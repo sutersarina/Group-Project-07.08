@@ -1,27 +1,30 @@
 # =====================================================================
 # RentCheck St. Gallen – Streamlit app
 # Compares your own rent with average rents of the regions in the
-# canton of St. Gallen. Three views: Home, RentCheck (for tenants)
-# and Landlords. RentCheck compares by region, rooms, area and year
-# built; a machine learning model estimates the expected rent.
+# canton of St. Gallen, based on real Flatfox listings (archiv.csv).
+# Three views: Home, RentCheck (for tenants) and Landlords. RentCheck
+# compares by region, rooms, area and year built; a machine learning
+# model estimates the expected rent.
 # Users can save their rent anonymously (SQLite); averages and the
 # model are then recalculated automatically. The landlord page uses
 # the same model to estimate a possible rent for an apartment.
 # =====================================================================
 
 # ---------- Import libraries ----------
+import json                     # Reading the canton border (GeoJSON)
 import sqlite3                  # Database (built into Python)
 from datetime import datetime   # Timestamp for saved entries
 from pathlib import Path        # File paths
 
 import streamlit as st          # Web app framework (user interface)
 import pandas as pd             # Tables / data (DataFrames)
-import numpy as np              # Random numbers for the sample data
 import altair as alt            # Charts
 import plotly.express as px     # Interactive map
+import plotly.graph_objects as go   # Extra map layer (single apartments)
 
 # Machine learning (scikit-learn)
 from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error, r2_score
 from sklearn.model_selection import KFold, cross_val_predict
@@ -118,6 +121,11 @@ header {background: transparent !important;}
     display: flex; align-items: center; justify-content: center;
     color: white; font-size: 1.6rem; font-weight: 700;
 }
+/* Team card: avatar and name centered in the box, one below the other */
+.team-card {display: flex; flex-direction: column; align-items: center; justify-content: center;
+            text-align: center;}
+/* Name below the avatar (no heading, as Streamlit adds a link icon next to headings) */
+.team-name {font-size: 1.1rem; font-weight: 600;}
 /* Footer at the very bottom */
 .footer {text-align: center; opacity: 0.5; font-size: 0.85rem; margin: 4rem 0 1rem;}
 </style>
@@ -125,7 +133,7 @@ header {background: transparent !important;}
 
 
 # =====================================================================
-# DATA: regions, database (SQLite)
+# DATA: regions, Flatfox listings (archiv.csv), database (SQLite)
 # =====================================================================
 
 # The 8 electoral districts (regions) of the canton of St. Gallen with the coordinates
@@ -139,49 +147,72 @@ REGIONS_GEO = pd.DataFrame({
     "lon":       [9.3767, 9.4932, 9.5427, 9.4728, 9.4413, 8.9806, 9.0870, 9.0447],
 })
 
-# Path of the database file (in the same folder as this script)
+# Paths of the database file and of the listings archive (in the same folder as this script)
 DB_PATH = Path(__file__).with_name("rentcheck.db")
+ARCHIVE_PATH = Path(__file__).with_name("archiv.csv")   # Real Flatfox listings, updated daily by sammeln.py
+CANTON_PATH = Path(__file__).with_name("kanton_sg.geojson")   # Border of the canton (for the map)
 
-# PLACEHOLDER data until the real BFS (Federal Statistical Office) data is loaded:
-# typical CHF price per m² per region and typical area per number of rooms
-BASE_PRICE_M2 = {"St. Gallen": 19, "Rorschach": 18, "Rheintal": 16, "Werdenberg": 16,
-                 "Sarganserland": 15, "See-Gaster": 18, "Toggenburg": 14, "Wil": 17}
-ROOMS_AREA = {1: 30, 1.5: 40, 2: 52, 2.5: 62, 3: 75, 3.5: 85, 4: 98, 4.5: 108, 5: 120}
 ROOMS_OPTIONS = [1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5, 5, 5.5, 6]   # Choices in the input fields
 
-# Plausibility limits for saved rents (CHF per m²), so that typos
+# Plausibility limits for rents (CHF per m²), so that typos
 # do not distort the average
 MIN_PRICE_M2 = 8
 MAX_PRICE_M2 = 60
 
-# Year built assumed for entries without a year built (from an older version)
-DEFAULT_YEAR_BUILT = 1990
-
-# SQL for creating the tables (base data and user entries)
-SQL_BASE_DATA = """CREATE TABLE IF NOT EXISTS base_data (
-                       id INTEGER PRIMARY KEY AUTOINCREMENT,
-                       region TEXT, rooms REAL, area REAL, year_built REAL, rent REAL)"""
+# SQL for creating the table with the user entries
 SQL_ENTRIES = """CREATE TABLE IF NOT EXISTS entries (
                      id INTEGER PRIMARY KEY AUTOINCREMENT,
                      region TEXT, rooms REAL, area REAL, year_built REAL, rent REAL,
                      created TEXT)"""
 
 
-def generate_base_data():
-    """Creates sample rents (placeholder for the BFS data), always with the same randomness."""
-    rng = np.random.default_rng(42)     # fixed seed -> always the same data
-    rows = []
-    for region, price in BASE_PRICE_M2.items():
-        for rooms, typical_area in ROOMS_AREA.items():
-            for _ in range(2):          # two sample apartments per region and number of rooms
-                area = int(round(typical_area * rng.uniform(0.9, 1.1)))
-                year_built = int(rng.integers(1900, 2025))              # random year built
-                rooms_factor = 1 + (3.5 - rooms) * 0.03                 # small apartments cost more per m²
-                year_factor = 1 + (year_built - 1990) * 0.003           # newer buildings cost more
-                rent = int(round(price * rooms_factor * year_factor * area
-                                 * rng.uniform(0.92, 1.08) / 10) * 10)
-                rows.append((region, float(rooms), area, year_built, rent))
-    return rows
+@st.cache_data(show_spinner=False)   # only read the file again when it has changed
+def load_listings(modified):
+    """Reads the real Flatfox listings from archiv.csv and keeps the usable apartments.
+    modified (time of the last change of the file) makes the cache reload the file
+    as soon as sammeln.py has updated the archive."""
+    raw = pd.read_csv(ARCHIVE_PATH)
+    latest = raw["zuletzt_gesehen"].max()     # Date of the last update -> these listings are online
+
+    # Only normal apartments: no houses, no furnished or temporary apartments
+    raw = raw[(raw["kategorie"] == "APARTMENT")
+              & ~raw["moebliert"].fillna(False).astype(bool)
+              & ~raw["befristet"].fillna(False).astype(bool)]
+
+    # Same columns as the user entries; the rent is the gross rent (incl. utilities)
+    listings = pd.DataFrame({
+        "region":     raw["wahlkreis"],
+        "rooms":      raw["zimmer"],
+        "area":       raw["flaeche_m2"],
+        "year_built": raw["baujahr"].where(raw["baujahr"].between(1800, 2030)),   # 0 etc. -> missing
+        "rent":       raw["miete_brutto"],
+        # Extra information for the map and the list of similar apartments
+        "town":       raw["plz"].astype(int).astype(str) + " " + raw["ort"],
+        "lat":        raw["lat"],
+        "lon":        raw["lon"],
+        "link":       raw["link"],
+        "online":     raw["zuletzt_gesehen"] == latest,
+    }).dropna(subset=["region", "rooms", "area", "rent"])
+
+    # Remove implausible listings (typos, parking spaces listed as apartments etc.)
+    price_m2 = listings["rent"] / listings["area"]
+    listings = listings[price_m2.between(MIN_PRICE_M2, MAX_PRICE_M2)
+                        & listings["rooms"].between(min(ROOMS_OPTIONS), max(ROOMS_OPTIONS))]
+    return listings.reset_index(drop=True)
+
+
+@st.cache_data(show_spinner=False)
+def load_towns(modified):
+    """All postcodes/towns in the archive with their region, e.g. {"9000 St. Gallen": "St. Gallen"}."""
+    raw = pd.read_csv(ARCHIVE_PATH, usecols=["plz", "ort", "wahlkreis"]).dropna().drop_duplicates()
+    towns = raw["plz"].astype(int).astype(str) + " " + raw["ort"]
+    return dict(sorted(zip(towns, raw["wahlkreis"])))
+
+
+@st.cache_data(show_spinner=False)
+def load_canton_outline():
+    """Border of the canton of St. Gallen (GeoJSON), drawn as a line on the map."""
+    return json.loads(CANTON_PATH.read_text(encoding="utf-8"))
 
 
 def table_columns(con, table):
@@ -190,34 +221,28 @@ def table_columns(con, table):
 
 
 def db_init():
-    """Creates the database and the tables (if they do not exist yet)."""
+    """Creates the database and the table for the user entries (if they do not exist yet)."""
     con = sqlite3.connect(DB_PATH)
-    con.execute(SQL_BASE_DATA)      # Table with the base data (later: BFS data)
     con.execute(SQL_ENTRIES)        # Table with the user entries (anonymous, no personal data)
-
-    # Insert the sample data on the very first start
-    if con.execute("SELECT COUNT(*) FROM base_data").fetchone()[0] == 0:
-        con.executemany("INSERT INTO base_data (region, rooms, area, year_built, rent) "
-                        "VALUES (?,?,?,?,?)", generate_base_data())
     con.commit()
     con.close()
 
 
 def load_all_data():
-    """Reads base data and user entries and returns them as one combined table."""
+    """Reads the Flatfox listings and the user entries and returns them as one combined table."""
+    listings = load_listings(ARCHIVE_PATH.stat().st_mtime).assign(source="Flatfox")
     con = sqlite3.connect(DB_PATH)
-    base = pd.read_sql_query(
-        "SELECT region, rooms, area, year_built, rent, 'Base' AS source FROM base_data", con)
     users = pd.read_sql_query(
         "SELECT region, rooms, area, year_built, rent, 'User' AS source FROM entries", con)
     con.close()
-    data = pd.concat([base, users], ignore_index=True)
-    data["year_built"] = data["year_built"].fillna(DEFAULT_YEAR_BUILT)   # replace missing year built
+    data = pd.concat([listings, users], ignore_index=True)
+    # Many listings do not state the year built -> use the median of the known years
+    data["year_built"] = data["year_built"].fillna(data["year_built"].median())
     return data
 
 
 def compute_regions(data):
-    """Computes the average price per m² for each region (from base data + user entries)."""
+    """Computes the average price per m² for each region (from listings + user entries)."""
     data = data.assign(price_m2=data["rent"] / data["area"])    # Price per m² of each apartment
     stats = (data.groupby("region")
              .agg(price=("price_m2", "mean"),                               # Average
@@ -267,6 +292,7 @@ def save_entry():
                  datetime.now().isoformat(timespec="seconds")))
     con.commit()
     con.close()
+    st.session_state["saved"] = True    # Only one entry per visit (protection against spam)
 
     after = region_average(region)      # Average after saving
     st.session_state["message"] = (
@@ -278,28 +304,44 @@ def save_entry():
 # =====================================================================
 # MACHINE LEARNING: estimate the rent
 # =====================================================================
-@st.cache_data(show_spinner=False)   # only retrain when the data changes
+@st.cache_data(show_spinner="Training the models …")   # only retrain when the data changes
 def train_model(data):
-    """Trains a linear regression model and measures its accuracy."""
+    """Trains two models (linear regression and random forest), measures their accuracy
+    and returns the more accurate one together with a comparison table."""
     X = data[["region", "rooms", "area", "year_built"]]   # Inputs (features)
     y = data["rent"]                                      # Target value: the rent
 
-    # Region is text -> convert to numbers with one-hot encoding, rooms/area/year stay as they are
-    preprocessing = ColumnTransformer(
-        [("region", OneHotEncoder(handle_unknown="ignore"), ["region"])],
-        remainder="passthrough")
-    model = Pipeline([("preprocessing", preprocessing),
-                      ("regression", LinearRegression())])
+    # The two candidates: a straight-line model and a model made of many decision trees
+    candidates = {
+        "Linear regression": LinearRegression(),
+        "Random forest": RandomForestRegressor(n_estimators=200, min_samples_leaf=3,
+                                               random_state=42, n_jobs=-1),
+    }
 
     # Measure accuracy with 5-fold cross-validation:
     # the model always predicts apartments it has not seen during training
     cv = KFold(n_splits=5, shuffle=True, random_state=42)
-    predictions = cross_val_predict(model, X, y, cv=cv)
-    mae = mean_absolute_error(y, predictions)     # average error in CHF
-    r2 = r2_score(y, predictions)                 # coefficient of determination (1 = perfect)
+    results = {}
+    for name, regressor in candidates.items():
+        # Region is text -> convert to numbers with one-hot encoding, rooms/area/year stay as they are
+        preprocessing = ColumnTransformer(
+            [("region", OneHotEncoder(handle_unknown="ignore"), ["region"])],
+            remainder="passthrough")
+        model = Pipeline([("preprocessing", preprocessing), ("regression", regressor)])
+        predictions = cross_val_predict(model, X, y, cv=cv)
+        mae = mean_absolute_error(y, predictions)     # average error in CHF
+        r2 = r2_score(y, predictions)                 # coefficient of determination (1 = perfect)
+        results[name] = (model, mae, r2, predictions)
 
+    # Keep the model with the smaller average error
+    best = min(results, key=lambda name: results[name][1])
+    model, mae, r2, predictions = results[best]
     model.fit(X, y)                               # Train the final model on all data
-    return model, mae, r2, predictions
+
+    scores = pd.DataFrame({"Model": list(results),
+                           "Avg. error (CHF)": [round(r[1]) for r in results.values()],
+                           "R²": [round(r[2], 2) for r in results.values()]})
+    return model, mae, r2, predictions, best, scores
 
 
 # =====================================================================
@@ -320,6 +362,60 @@ def section(label, title):
         # Title only, without a label
         st.markdown(f'<div class="section-title no-label">{title}</div>',
                     unsafe_allow_html=True)
+
+
+def clear_town(town_key):
+    """Empties the town search when the region is changed by hand (the town would no longer match)."""
+    st.session_state.pop(town_key, None)
+
+
+def town_picker(region_key):
+    """Search field for postcode/town; choosing a town sets the matching region."""
+    towns = load_towns(ARCHIVE_PATH.stat().st_mtime)
+    town_key = f"{region_key}_town"
+
+    def adopt_region():
+        # Called when a town is chosen: set the region select box to the town's region
+        town = st.session_state[town_key]
+        if town:
+            st.session_state[region_key] = towns[town]
+
+    st.selectbox("Town or postcode (optional)", list(towns), index=None, key=town_key,
+                 placeholder="Type e.g. 9000 or Wil …", on_change=adopt_region,
+                 help="Not sure which region you live in? Choose your town and the "
+                      "region is set automatically.")
+
+
+def similar_listings(data, region, rooms):
+    """Flatfox apartments similar to the input: same region and at most ½ room more or less.
+    If there are too few in the region, the whole canton is used.
+    Returns the apartments and a short description of the selection."""
+    flatfox = data[data["source"] == "Flatfox"]
+    near = flatfox[(flatfox["rooms"] - rooms).abs() <= 0.5]
+    rooms_text = f"{max(1, rooms - 0.5):g}–{rooms + 0.5:g} rooms"
+    in_region = near[near["region"] == region]
+    if len(in_region) >= 10:
+        return in_region, f"{rooms_text} in {region}"
+    return near, f"{rooms_text} in the whole canton"
+
+
+def listing_table(similar, area):
+    """Shows the similar apartments that are online right now, the closest in size first."""
+    online = similar[similar["online"].eq(True)]
+    online = online.assign(size_diff=(online["area"] - area).abs()).sort_values("size_diff").head(8)
+    if online.empty:
+        st.caption("No similar apartments are online right now.")
+        return
+    table = pd.DataFrame({"Town": online["town"], "Rooms": online["rooms"],
+                          "Area (m²)": online["area"], "Gross rent (CHF)": online["rent"],
+                          "CHF per m²": (online["rent"] / online["area"]).round(1),
+                          "Listing": online["link"]})
+    st.dataframe(table, hide_index=True, width="stretch", column_config={
+        "Rooms": st.column_config.NumberColumn(format="%g"),
+        "Area (m²)": st.column_config.NumberColumn(format="%.0f"),
+        "Gross rent (CHF)": st.column_config.NumberColumn(format="%.0f"),
+        "Listing": st.column_config.LinkColumn(display_text="Open on Flatfox"),
+    })
 
 
 def go_to(page):
@@ -358,8 +454,8 @@ def page_home():
     <div class="hero">
         <span class="badge">CS PROJECT · HSG</span>
         <h1>Is your rent fair?</h1>
-        <p>RentCheck compares rents in the canton of St. Gallen with official data
-        from the Federal Statistical Office – in a few seconds.</p>
+        <p>RentCheck compares rents in the canton of St. Gallen with real rental
+        listings from Flatfox – in a few seconds.</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -385,7 +481,8 @@ def page_home():
     f1, f2, f3 = st.columns(3)
     f1.markdown(card("📊", "Comparison", "Rate your rent by region, rooms, area and year built – "
                      "and contribute your own rent anonymously"), unsafe_allow_html=True)
-    f2.markdown(card("🗺️", "Regions", "The 8 regions of the canton of St. Gallen on the map"),
+    f2.markdown(card("🗺️", "Regions", "The 8 regions of the canton of St. Gallen on the map, "
+                     "colored by price per m² – and similar apartments online right now"),
                 unsafe_allow_html=True)
     f3.markdown(card("🤖", "Prediction", "An ML model estimates what an apartment should cost – "
                      "also for landlords"), unsafe_allow_html=True)
@@ -393,19 +490,22 @@ def page_home():
     # ----- How it works: three numbered steps -----
     section("How it works", "How does it work?")
     for i, text in enumerate([
-        "You choose your region (or click it on the map) and enter rooms, living area and rent.",
-        "A machine learning model estimates from the data what the apartment should cost.",
-        "You immediately see whether your offer is cheap, fair or expensive.",
+        "You search your town (or click your region on the map) and enter rooms, living area "
+        "and rent.",
+        "A machine learning model estimates from real Flatfox listings what the apartment "
+        "should cost.",
+        "You immediately see whether your offer is cheap, fair or expensive – and how it "
+        "compares with similar apartments on the market.",
     ], start=1):
         st.markdown(f'<div class="step"><div class="step-num">{i}</div><p>{text}</p></div>',
                     unsafe_allow_html=True)
 
     # ----- Team: one card per person with initial -----
     section("Team", "Who is behind it")
-    team = ["Riana", "Name 2", "Name 3"]   # Adjust the names here
+    team = ["Riana", "Sarina", "Noreen"]
     for col, name in zip(st.columns(3), team):
-        col.markdown(f'<div class="card" style="text-align:center">'
-                     f'<div class="avatar">{name[0]}</div><h4>{name}</h4></div>',
+        col.markdown(f'<div class="card team-card">'
+                     f'<div class="avatar">{name[0]}</div><div class="team-name">{name}</div></div>',
                      unsafe_allow_html=True)
 
 
@@ -435,11 +535,16 @@ def page_compare():
         st.session_state["region"] = "St. Gallen"
 
     # Newer Plotly versions call the function scatter_map, older ones scatter_mapbox
-    scatter = getattr(px, "scatter_map", None) or px.scatter_mapbox
-    map_kwargs = {"map_style": "open-street-map"} if hasattr(px, "scatter_map") \
+    new_plotly = hasattr(px, "scatter_map")
+    scatter = px.scatter_map if new_plotly else px.scatter_mapbox
+    map_kwargs = {"map_style": "open-street-map"} if new_plotly \
         else {"mapbox_style": "open-street-map"}
 
-    # Create the map: one point per region (position via lat/lon)
+    # Option: additionally show every single apartment as a small point
+    show_listings = st.toggle("Show individual apartments", key="show_listings")
+
+    # Create the map: one point per region (position via lat/lon),
+    # colored by the price per m²; the selected region is drawn larger
     fig = scatter(
         regions,
         lat="lat", lon="lon",
@@ -447,36 +552,54 @@ def page_compare():
         hover_data={"Main town": True, "CHF per m²": True, "Entries": True,
                     "lat": False, "lon": False},
         text="Region",                       # Label at the point
-        size=[1] * len(regions),             # All points the same size
-        size_max=16,
-        color_discrete_sequence=["#a855f7"],
+        color="CHF per m²",                  # Color = average price per m²
+        color_continuous_scale=["#c7c9f5", "#a855f7", "#ec4899"],   # cheap = light, expensive = pink
+        range_color=[regions["CHF per m²"].min(), regions["CHF per m²"].max()],
+        size=[3 if r == st.session_state["region"] else 1 for r in regions["Region"]],
+        size_max=26,
         zoom=8.2,                            # Zoom level at the start
         center={"lat": 47.25, "lon": 9.25},  # Map center (canton of St. Gallen)
         height=480,
         **map_kwargs,
     )
-    # Highlight the selected region (pink), all others purple
-    sel_idx = regions.index[regions["Region"] == st.session_state["region"]][0]
-    fig.update_traces(
-        marker=dict(color=["#ec4899" if i == sel_idx else "#a855f7"
-                           for i in range(len(regions))]),
-        textposition="top center",
-    )
-    # Remove margins and hide the legend
-    fig.update_layout(margin=dict(l=0, r=0, t=0, b=0), showlegend=False)
+    fig.update_traces(textposition="top center")
+
+    # Layer with the single apartments (same color scale as the regions)
+    if show_listings:
+        flats = data[data["source"] == "Flatfox"]
+        flats = flats.assign(price_m2=(flats["rent"] / flats["area"]).round(1))
+        trace = (go.Scattermap if new_plotly else go.Scattermapbox)(
+            lat=flats["lat"], lon=flats["lon"], mode="markers",
+            marker=dict(size=7, opacity=0.6, color=flats["price_m2"], coloraxis="coloraxis"),
+            text=flats["town"], customdata=flats[["rooms", "area", "rent", "price_m2"]],
+            hovertemplate="<b>%{text}</b><br>%{customdata[0]:g} rooms, %{customdata[1]:.0f} m²"
+                          "<br>CHF %{customdata[2]:,.0f} (CHF %{customdata[3]} per m²)<extra></extra>")
+        fig.add_trace(trace)
+        fig.data = fig.data[::-1]            # draw the apartments below the region points
+    region_curve = len(fig.data) - 1         # The region points are the last layer
+
+    # Border of the canton as a line, no margins, legend hidden, small color bar
+    fig.update_layout({"map" if new_plotly else "mapbox": {"layers": [
+                          {"source": load_canton_outline(), "type": "line",
+                           "color": "#6366f1", "line": {"width": 2}}]}},
+                      margin=dict(l=0, r=0, t=0, b=0), showlegend=False,
+                      coloraxis_colorbar=dict(title="CHF/m²", thickness=12))
 
     # Show the map; clicking a point reloads the app
     event = st.plotly_chart(fig, on_select="rerun", selection_mode="points",
                             key="sg_map", width="stretch")
 
-    # Click on the map -> adopt the region (only if the selection has changed)
-    points = event.selection.points if event and event.selection else []
+    # Click on a region point -> adopt the region (only if the selection has changed);
+    # clicks on single apartments are ignored
+    points = [p for p in (event.selection.points if event and event.selection else [])
+              if p["curve_number"] == region_curve]
     if points:
         clicked = regions.iloc[points[0]["point_index"]]["Region"]
         if st.session_state.get("last_map_selection") != clicked:
             st.session_state["last_map_selection"] = clicked
             if st.session_state["region"] != clicked:
                 st.session_state["region"] = clicked
+                clear_town("region_town")   # The searched town no longer matches
                 st.rerun()   # Reload the app so the select box shows the new region
 
     # ----- Comparison: inputs -----
@@ -485,14 +608,17 @@ def page_compare():
     # Two columns: inputs and result on the left, chart on the right
     left, right = st.columns([1, 1.3], gap="large")
     with left:
-        region = st.selectbox("Region", regions["Region"], key="region")                     # Choose region
+        town_picker("region")                                                                # Search town -> region
+        region = st.selectbox("Region", regions["Region"], key="region",
+                              on_change=clear_town, args=("region_town",))                   # Choose region
         rooms = st.selectbox("Number of rooms", ROOMS_OPTIONS, index=4, key="rooms")         # Choose rooms
-        area = st.slider("Living area (m²)", 20, 150, 70, key="area")                        # Choose area
+        area = st.slider("Living area (m²)", 20, 250, 70, key="area")                        # Choose area
         year_built = st.slider("Year the building was built", 1900, 2026, 1990, key="year_built")  # Choose year built
-        rent = st.number_input("Your rent (CHF)", 500, 6000, 1800, step=50, key="rent")      # Your own rent
+        rent = st.number_input("Your gross rent (CHF, incl. utilities)", 300, 10000, 1600, step=50,
+                               key="rent")      # Your own rent
 
     # ----- Expected rent: the ML model estimates it from region, rooms, area and year built -----
-    model, mae, r2, predictions = train_model(data)
+    model, mae, r2, predictions, model_name, scores = train_model(data)
     input_row = pd.DataFrame({"region": [region], "rooms": [float(rooms)],
                               "area": [float(area)], "year_built": [float(year_built)]})
     expected = float(model.predict(input_row)[0])   # Estimated rent
@@ -552,22 +678,51 @@ def page_compare():
 
     # Info about the data basis (number of entries in total and from users)
     user_count = int((data["source"] == "User").sum())
-    st.caption(f"⚠️ The basis is sample data (real BFS data to follow). "
-               f"Current data basis: {len(data)} entries, of which {user_count} from users.")
+    st.caption(f"Data basis: {len(data)} apartments – rental listings from Flatfox "
+               f"(updated daily) and {user_count} entries from users. All rents are gross rents "
+               f"incl. utilities.")
+
+    # ----- Market: where does your rent stand among similar apartments? -----
+    section("Market", "How do you compare with similar apartments?")
+    similar, scope = similar_listings(data, region, float(rooms))
+    if similar.empty:
+        st.caption("There are no similar apartments in the data yet.")
+    else:
+        share = (similar["rent"] < rent).mean() * 100     # Share of similar apartments that are cheaper
+        st.write(f"Your rent is higher than **{share:.0f}%** of {len(similar)} similar "
+                 f"apartments ({scope}).")
+        # Histogram: how many similar apartments cost how much; pink line = your rent
+        histogram = (alt.Chart(similar)
+                     .mark_bar(color="#c7c9f5", cornerRadiusTopLeft=4, cornerRadiusTopRight=4)
+                     .encode(x=alt.X("rent:Q", bin=alt.Bin(maxbins=30), title="Gross rent (CHF)"),
+                             y=alt.Y("count()", title="Apartments", axis=alt.Axis(grid=False)),
+                             tooltip=[alt.Tooltip("count()", title="Apartments")]))
+        own_line = (alt.Chart(pd.DataFrame({"rent": [rent]}))
+                    .mark_rule(color="#ec4899", strokeWidth=3)
+                    .encode(x="rent:Q"))
+        st.altair_chart((histogram + own_line).properties(height=260), width="stretch")
+        st.caption("Gross rents of similar apartments. The pink line is your rent.")
+
+        # Similar apartments that are on Flatfox right now
+        st.markdown("**Similar apartments online right now**")
+        listing_table(similar, area)
 
     # ----- Save your own rent -----
     section("Join in", "Save your rent anonymously")
     st.write("With your entry, the averages and the estimate become more accurate. "
              "Only region, rooms, area, year built and rent from the fields above are saved – "
              "no personal data.")
-    # Button: calls save_entry() on click
+    # Button: calls save_entry() on click; only one entry per visit
+    already_saved = st.session_state.get("saved", False)
     st.button("💾 Save my rent", key="save", type="primary",
-              on_click=save_entry)
+              on_click=save_entry, disabled=already_saved)
     # Show feedback after saving (only once)
     message = st.session_state.pop("message", None)
     if message:
         kind, text = message
         (st.success if kind == "ok" else st.warning)(text)
+    elif already_saved:
+        st.caption("You have already saved your rent during this visit – thank you!")
 
     # ----- Comparison of all regions: price per m² -----
     section("Regions", "Price per m² compared")
@@ -597,6 +752,7 @@ def page_compare():
               help="1.00 = perfect prediction, 0 = no better than the average.")
     m3.metric("Training data", f"{len(data)}", f"{user_count} from users",
               delta_color="off")
+    st.caption(f"Model used: {model_name} (the more accurate of two models, see details).")
 
     # Details about the model (chart and explanation), expandable
     with st.expander("Model details"):
@@ -612,7 +768,7 @@ def page_compare():
                                 y=alt.Y("Estimated", scale=alt.Scale(domain=bounds),
                                         title="Estimated rent (CHF)"),
                                 color=alt.Color("Source", scale=alt.Scale(
-                                    domain=["Base", "User"], range=["#a855f7", "#ec4899"])),
+                                    domain=["Flatfox", "User"], range=["#a855f7", "#ec4899"])),
                                 tooltip=["Region", "Actual", "Estimated", "Source"]))
         diagonal = (alt.Chart(pd.DataFrame({"x": bounds, "y": bounds}))
                     .mark_line(color="gray", strokeDash=[4, 4]).encode(x="x", y="y"))
@@ -620,12 +776,17 @@ def page_compare():
         st.caption("Each point is an apartment. The estimate comes from cross-validation: "
                    "the model predicts apartments it has not seen during training.")
         st.write(
-            "A **linear regression** (scikit-learn) is used. It learns from the data "
-            "how strongly region, number of rooms, area and year built influence the rent. "
+            "Two models (scikit-learn) learn from the data how region, number of rooms, area "
+            "and year built influence the rent: a **linear regression** (one straight-line "
+            "formula) and a **random forest** (200 decision trees whose estimates are averaged). "
             "The accuracy is measured with **5-fold cross-validation**: "
             "the data is split into 5 parts, the model learns from 4 parts and is tested on the "
-            "remaining part. As soon as someone saves their rent, the model is "
+            "remaining part. The app uses the model with the smaller error – currently the "
+            f"**{model_name.lower()}**. As soon as someone saves their rent, both models are "
             "automatically retrained with the new data.")
+        st.dataframe(scores, hide_index=True, width="stretch")
+        st.caption("Many listings do not state the year built; for those, the median year "
+                   "of the other apartments is used.")
 
 
 # =====================================================================
@@ -634,7 +795,7 @@ def page_compare():
 def page_landlord():
     # Load the current data and train the model (automatically again when there is new data)
     data = load_all_data()
-    model, mae, r2, _ = train_model(data)
+    model, mae, r2, _, model_name, _ = train_model(data)
 
     # ----- Page title -----
     st.markdown("""
@@ -649,9 +810,11 @@ def page_landlord():
     section("Your apartment", "Enter the key facts")
     left, right = st.columns([1, 1.3], gap="large")
     with left:
-        region = st.selectbox("Region", REGIONS_GEO["Region"], key="l_region")                  # Choose region
+        town_picker("l_region")                                                                 # Search town -> region
+        region = st.selectbox("Region", REGIONS_GEO["Region"], key="l_region",
+                              on_change=clear_town, args=("l_region_town",))                    # Choose region
         rooms = st.selectbox("Number of rooms", ROOMS_OPTIONS, index=4, key="l_rooms")          # Choose rooms
-        area = st.slider("Living area (m²)", 20, 150, 70, key="l_area")                         # Choose area
+        area = st.slider("Living area (m²)", 20, 250, 70, key="l_area")                         # Choose area
         year_built = st.slider("Year the building was built", 1900, 2026, 1990, key="l_year_built")  # Choose year built
 
     # ----- Estimate by the ML model -----
@@ -666,7 +829,7 @@ def page_landlord():
     with right:
         st.markdown(f"""
         <div class="result" style="background:linear-gradient(135deg, #6366f1, #a855f7)">
-            Possible monthly rent
+            Possible monthly gross rent
             <span class="big">CHF {estimate:,.0f}</span>
             Range: CHF {low:,.0f} – {high:,.0f}
         </div>""", unsafe_allow_html=True)
@@ -703,11 +866,17 @@ def page_landlord():
     st.caption(f"Estimated rent for {rooms:g} rooms, {area} m² in {region} depending on the year built. "
                f"The pink marker is your building.")
 
+    # ----- Comparable apartments on the market right now -----
+    section("Market", "Comparable apartments online right now")
+    similar, scope = similar_listings(data, region, float(rooms))
+    st.caption(f"Flatfox listings with {scope}, the closest in size first.")
+    listing_table(similar, area)
+
     # ----- Notes -----
     user_count = int((data["source"] == "User").sum())
-    st.caption(f"⚠️ The basis is sample data (real BFS data to follow). "
-               f"Current data basis: {len(data)} entries, of which {user_count} from tenants. "
-               f"Model accuracy: R² = {r2:.2f}.")
+    st.caption(f"Data basis: {len(data)} apartments – rental listings from Flatfox "
+               f"(updated daily) and {user_count} entries from tenants. "
+               f"Model: {model_name}, R² = {r2:.2f}.")
     st.info("The result is a rough guideline and not legal or investment advice. "
             "Condition, location, fit-out standard and legal rules on permissible rents are "
             "not taken into account – a professional can help with questions.")
@@ -716,7 +885,7 @@ def page_landlord():
 # =====================================================================
 # MAIN PROGRAM: show the selected view
 # =====================================================================
-# Create the database (fill it with sample data on the first start)
+# Create the database for the user entries
 db_init()
 
 # On the first start (or with an invalid value) the home page is active
