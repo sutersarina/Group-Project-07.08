@@ -5,7 +5,8 @@
 # A machine learning model estimates the expected rent. Users can save
 # their rent anonymously (SQLite); averages and model update automatically.
 #
-# Marked with "AI-GENERATED" is written by Claude
+# Marked with "AI-GENERATED" are the 4 hardest parts, written by the AI
+# (Claude), not by us.
 # =====================================================================
 import json
 import sqlite3
@@ -193,6 +194,8 @@ def load_all_data():
         "SELECT region, rooms, area, year_built, rent, 'User' AS source FROM entries", con)
     con.close()
     data = pd.concat([listings, users], ignore_index=True)
+    # Without user entries the empty table makes the columns "object" -> force numbers
+    data[["rooms", "area", "year_built", "rent"]] = data[["rooms", "area", "year_built", "rent"]].astype(float)
     # Many listings do not state the year built -> use the median of the known years
     data["year_built"] = data["year_built"].fillna(data["year_built"].median())
     return data
