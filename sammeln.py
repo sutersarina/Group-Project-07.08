@@ -1,13 +1,18 @@
+# AI-GENERATED: this whole file was written by Claude (Anthropic)
+
 """
-Sammelt jeden Tag die Flatfox-Mietinserate im Kanton St. Gallen in einem Archiv.
+Collects the Flatfox rental listings of the canton of St. Gallen in an archive every day.
  
-- Jedes Inserat steht nur EINMAL in archiv.csv (erkannt an seiner id).
-- "zuerst_gesehen": Tag, an dem das Inserat zum ersten Mal online war.
-- "zuletzt_gesehen": letzter Tag, an dem es noch online war.
-- Inserate, die seit mehr als 12 Monaten nicht mehr online waren, werden gelöscht.
+- Each listing appears only ONCE in archiv.csv (recognised by its id).
+- "zuerst_gesehen" (first seen): day the listing was online for the first time.
+- "zuletzt_gesehen" (last seen): last day the listing was still online.
+- Listings that have not been online for more than 12 months are deleted.
  
-Wird täglich automatisch von GitHub Actions gestartet
-(siehe .github/workflows/archiv_taeglich.yml). Von Hand starten:
+The column names in archiv.csv stay in German on purpose: streamlit_app.py reads
+them, and the existing archive already uses them.
+ 
+Started automatically every day by GitHub Actions
+(see .github/workflows/archiv_taeglich.yml). To start it by hand:
     python sammeln.py
 """
  
@@ -20,48 +25,48 @@ from datetime import date, timedelta
 import pandas as pd
 import requests
  
-ORDNER = os.path.dirname(os.path.abspath(__file__))
-ARCHIV = os.path.join(ORDNER, "archiv.csv")
-KANTONSGRENZE = os.path.join(ORDNER, "kanton_sg.geojson")
-AUFBEWAHREN_TAGE = 365  # 12 Monate
+FOLDER = os.path.dirname(os.path.abspath(__file__))
+ARCHIVE = os.path.join(FOLDER, "archiv.csv")
+CANTON_BORDER = os.path.join(FOLDER, "kanton_sg.geojson")
+KEEP_DAYS = 365  # 12 months
  
 FLATFOX_URL = "https://flatfox.ch/api/v1/public-listing/"
-PLZ_URL = "https://openplzapi.org/ch/Cantons/17/Localities"  # 17 = Kanton St. Gallen
-SEITENGROESSE = 100  # Maximum, das die Flatfox-API pro Anfrage liefert
-GLEICHZEITIG = 8     # so viele Seiten werden parallel geladen
+POSTCODE_URL = "https://openplzapi.org/ch/Cantons/17/Localities"  # 17 = canton of St. Gallen
+PAGE_SIZE = 100   # maximum the Flatfox API returns per request
+PARALLEL = 8      # this many pages are loaded at the same time
  
-# Diese Ausstattungsmerkmale werden zu eigenen Ja/Nein-Spalten
-MERKMALE = [
+# These features become their own yes/no columns
+FEATURES = [
     "balconygarden", "lift", "washingmachine", "tumbler", "dishwasher",
     "view", "parkingspace", "garage", "fireplace", "petsallowed",
 ]
  
  
-def lade_sg_postleitzahlen():
-    """Holt alle Ortschaften im Kanton SG mit Gemeinde und Wahlkreis.
+def load_sg_postcodes():
+    """Loads all localities in the canton of SG with their municipality and district.
  
-    Eine Postleitzahl kann zu mehreren Ortschaften gehören (z.B. 9500 Wil),
-    darum gibt es pro Postleitzahl eine Liste.
+    One postcode can belong to several localities (e.g. 9500 Wil),
+    so there is a list per postcode.
     """
-    plz = {}
-    seite = 1
+    postcodes = {}
+    page = 1
     while True:
-        antwort = requests.get(PLZ_URL, params={"page": seite, "pageSize": 50}, timeout=30)
-        antwort.raise_for_status()
-        eintraege = antwort.json()
-        if not eintraege:
+        response = requests.get(POSTCODE_URL, params={"page": page, "pageSize": 50}, timeout=30)
+        response.raise_for_status()
+        entries = response.json()
+        if not entries:
             break
-        for e in eintraege:
-            plz.setdefault(int(e["postalCode"]), []).append({
-                "ortschaft": e.get("name", ""),
-                "gemeinde": e["commune"]["name"],
-                "wahlkreis": e["district"]["shortName"],
+        for e in entries:
+            postcodes.setdefault(int(e["postalCode"]), []).append({
+                "ortschaft": e.get("name", ""),        # locality
+                "gemeinde": e["commune"]["name"],      # municipality (column in archiv.csv)
+                "wahlkreis": e["district"]["shortName"],  # district (column in archiv.csv)
             })
-        seite += 1
-    return plz
+        page += 1
+    return postcodes
  
  
-def vereinfache(name):
+def simplify(name):
     """'Gossau SG' -> 'gossau', 'Zuzwil (SG)' -> 'zuzwil', 'Sankt Gallen' -> 'st gallen'"""
     name = str(name or "").split(",")[0]               # 'Widnau, Sankt Gallen' -> 'Widnau'
     name = re.sub(r"\(.*?\)", "", name).lower().strip()
@@ -69,190 +74,192 @@ def vereinfache(name):
     return re.sub(r"\s+(sg|zh|tg|ar|ai|gr|gl|sz)$", "", name).strip()
  
  
-def finde_ort(ortschaften, stadt):
-    """Wählt bei mehreren Ortschaften pro Postleitzahl die passende aus (über den Ortsnamen)."""
-    stadt = vereinfache(stadt)
-    # Zuerst nach der Gemeinde suchen: dieselbe Ortschaft (z.B. "Wil SG") kann
-    # mehreren Gemeinden zugeordnet sein (Wil, Kirchberg, Zuzwil ...)
-    for o in ortschaften:
-        if vereinfache(o["gemeinde"]) == stadt:
-            return o
-    for o in ortschaften:
-        if vereinfache(o["ortschaft"]) == stadt:
-            return o
-    return ortschaften[0]
+def find_place(localities, city):
+    """If a postcode has several localities, picks the matching one (by the place name)."""
+    city = simplify(city)
+    # Search by municipality first: the same locality (e.g. "Wil SG") can belong
+    # to several municipalities (Wil, Kirchberg, Zuzwil ...)
+    for loc in localities:
+        if simplify(loc["gemeinde"]) == city:
+            return loc
+    for loc in localities:
+        if simplify(loc["ortschaft"]) == city:
+            return loc
+    return localities[0]
  
  
-def lade_kantonsgrenze():
-    """Liest die Umrisse des Kantons SG (Liste von Polygonen; das erste Ringstück ist
-    der Rand, weitere sind Löcher, z.B. die Kantone Appenzell)."""
-    with open(KANTONSGRENZE, encoding="utf-8") as f:
+def load_canton_border():
+    """Reads the outline of the canton of SG (list of polygons; the first ring is
+    the outer edge, further rings are holes, e.g. the cantons of Appenzell)."""
+    with open(CANTON_BORDER, encoding="utf-8") as f:
         return json.load(f)["geometry"]["coordinates"]
  
  
-def punkt_im_ring(lon, lat, ring):
-    """Strahl-Methode: zählt, wie oft eine Linie vom Punkt nach rechts den Rand schneidet."""
-    drin = False
+def point_in_ring(lon, lat, ring):
+    """Ray casting: counts how often a line from the point to the right crosses the edge."""
+    inside = False
     j = len(ring) - 1
     for i in range(len(ring)):
         xi, yi = ring[i]
         xj, yj = ring[j]
         if (yi > lat) != (yj > lat) and lon < (xj - xi) * (lat - yi) / (yj - yi) + xi:
-            drin = not drin
+            inside = not inside
         j = i
-    return drin
+    return inside
  
  
-def liegt_im_kanton(lon, lat, grenze):
-    for polygon in grenze:
-        rand, loecher = polygon[0], polygon[1:]
-        if punkt_im_ring(lon, lat, rand) and not any(punkt_im_ring(lon, lat, l) for l in loecher):
+def is_in_canton(lon, lat, border):
+    for polygon in border:
+        edge, holes = polygon[0], polygon[1:]
+        if point_in_ring(lon, lat, edge) and not any(point_in_ring(lon, lat, h) for h in holes):
             return True
     return False
  
  
-def lade_seite(offset):
-    """Holt eine Seite mit bis zu 100 Inseraten."""
-    antwort = requests.get(
-        FLATFOX_URL, params={"limit": SEITENGROESSE, "offset": offset}, timeout=60
+def load_page(offset):
+    """Loads one page with up to 100 listings."""
+    response = requests.get(
+        FLATFOX_URL, params={"limit": PAGE_SIZE, "offset": offset}, timeout=60
     )
-    antwort.raise_for_status()
-    return antwort.json()
+    response.raise_for_status()
+    return response.json()
  
  
-def lade_flatfox_inserate():
-    """Holt alle Inserate der Schweiz (die API kann nicht nach Kanton filtern)."""
-    erste = lade_seite(0)
-    offsets = range(SEITENGROESSE, erste["count"], SEITENGROESSE)
-    inserate = list(erste["results"])
-    with ThreadPoolExecutor(max_workers=GLEICHZEITIG) as pool:
-        for daten in pool.map(lade_seite, offsets):
-            inserate.extend(daten["results"])
-    return inserate
+def load_flatfox_listings():
+    """Loads all listings in Switzerland (the API cannot filter by canton)."""
+    first = load_page(0)
+    offsets = range(PAGE_SIZE, first["count"], PAGE_SIZE)
+    listings = list(first["results"])
+    with ThreadPoolExecutor(max_workers=PARALLEL) as pool:
+        for data in pool.map(load_page, offsets):
+            listings.extend(data["results"])
+    return listings
  
  
-def merkmal_namen(attributes):
-    """Ausstattung kann als Liste von Texten oder von {"name": ...} kommen."""
-    namen = set()
+def feature_names(attributes):
+    """Features can come as a list of texts or as a list of {"name": ...}."""
+    names = set()
     for a in attributes or []:
-        namen.add(a["name"] if isinstance(a, dict) else a)
-    return namen
+        names.add(a["name"] if isinstance(a, dict) else a)
+    return names
  
  
-def baue_tabelle(alle, sg_plz):
-    """Macht aus den Flatfox-Daten eine Tabelle, nur Mietwohnungen und Häuser im Kanton SG."""
-    grenze = lade_kantonsgrenze()
-    zeilen = []
-    for i in alle:
+def build_table(all_listings, sg_postcodes):
+    """Turns the Flatfox data into a table, only rental apartments and houses in the canton of SG."""
+    border = load_canton_border()
+    rows = []
+    for i in all_listings:
         if i.get("offer_type") != "RENT":
             continue
         if i.get("object_category") not in ("APARTMENT", "HOUSE"):
             continue
-        if i.get("zipcode") is None or int(i["zipcode"]) not in sg_plz:
+        if i.get("zipcode") is None or int(i["zipcode"]) not in sg_postcodes:
             continue
-        # Manche Postleitzahlen gelten über die Kantonsgrenze hinweg (z.B. 8630 Rüti ZH),
-        # darum zusätzlich prüfen, ob die Wohnung wirklich im Kanton SG liegt
+        # Some postcodes cross the canton border (e.g. 8630 Rüti ZH),
+        # so we also check whether the apartment really lies in the canton of SG
         if i.get("latitude") and i.get("longitude"):
-            if not liegt_im_kanton(i["longitude"], i["latitude"], grenze):
+            if not is_in_canton(i["longitude"], i["latitude"], border):
                 continue
  
-        ort = finde_ort(sg_plz[int(i["zipcode"])], i.get("city"))
-        ausstattung = merkmal_namen(i.get("attributes"))
-        zeile = {
+        place = find_place(sg_postcodes[int(i["zipcode"])], i.get("city"))
+        features = feature_names(i.get("attributes"))
+        # The keys are the column names of archiv.csv (German, read by streamlit_app.py)
+        row = {
             "id": i.get("pk"),
             "link": "https://flatfox.ch" + i["url"] if i.get("url") else None,
-            "kategorie": i.get("object_category"),
-            "typ": i.get("object_type"),
-            "plz": i.get("zipcode"),
-            "ort": i.get("city"),
-            "gemeinde": ort["gemeinde"],
-            "wahlkreis": ort["wahlkreis"],
-            "miete_netto": i.get("rent_net"),
-            "nebenkosten": i.get("rent_charges"),
-            "miete_brutto": i.get("rent_gross"),
-            "zimmer": float(i["number_of_rooms"]) if i.get("number_of_rooms") else None,
-            "flaeche_m2": i.get("surface_living"),
-            "baujahr": i.get("year_built"),
-            "renovationsjahr": i.get("year_renovated"),
-            "stockwerk": i.get("floor"),
-            "moebliert": i.get("is_furnished"),
-            "befristet": i.get("is_temporary"),
+            "kategorie": i.get("object_category"),       # category
+            "typ": i.get("object_type"),                 # type
+            "plz": i.get("zipcode"),                     # postcode
+            "ort": i.get("city"),                        # town
+            "gemeinde": place["gemeinde"],               # municipality
+            "wahlkreis": place["wahlkreis"],             # district
+            "miete_netto": i.get("rent_net"),            # net rent
+            "nebenkosten": i.get("rent_charges"),        # utilities
+            "miete_brutto": i.get("rent_gross"),         # gross rent
+            "zimmer": float(i["number_of_rooms"]) if i.get("number_of_rooms") else None,  # rooms
+            "flaeche_m2": i.get("surface_living"),       # living area
+            "baujahr": i.get("year_built"),              # year built
+            "renovationsjahr": i.get("year_renovated"),  # year renovated
+            "stockwerk": i.get("floor"),                 # floor
+            "moebliert": i.get("is_furnished"),          # furnished
+            "befristet": i.get("is_temporary"),          # temporary
             "lat": i.get("latitude"),
             "lon": i.get("longitude"),
         }
-        for m in MERKMALE:
-            zeile[m] = m in ausstattung
-        zeilen.append(zeile)
+        for f in FEATURES:
+            row[f] = f in features
+        rows.append(row)
  
-    df = pd.DataFrame(zeilen)
+    df = pd.DataFrame(rows)
     if not df.empty:
-        # Miete pro m² (netto), nur wo beides vorhanden ist
+        # Net rent per m², only where both values exist
         df["miete_pro_m2"] = (df["miete_netto"] / df["flaeche_m2"]).round(2)
     return df
  
  
-def hole_heutige_inserate():
-    """Alle Inserate, die heute im Kanton SG online sind."""
-    return baue_tabelle(lade_flatfox_inserate(), lade_sg_postleitzahlen())
+def get_todays_listings():
+    """All listings that are online in the canton of SG today."""
+    return build_table(load_flatfox_listings(), load_sg_postcodes())
  
  
-def aktualisiere_archiv(archiv, heute_df, heute):
-    """Fügt die heutigen Inserate ins Archiv ein und löscht alte.
+def update_archive(archive, today_df, today):
+    """Adds today's listings to the archive and deletes old ones.
  
-    - neues Inserat: zuerst_gesehen = heute
-    - bekanntes Inserat: zuerst_gesehen bleibt, die übrigen Werte werden
-      aktualisiert (z.B. wenn die Miete geändert wurde)
-    - alle heutigen Inserate: zuletzt_gesehen = heute
+    - new listing: zuerst_gesehen = today
+    - known listing: zuerst_gesehen stays, the other values are
+      updated (e.g. if the rent was changed)
+    - all of today's listings: zuletzt_gesehen = today
     """
-    heute_df = heute_df.copy()
-    heute_df["zuletzt_gesehen"] = heute
+    today_df = today_df.copy()
+    today_df["zuletzt_gesehen"] = today
  
-    if archiv.empty:
-        heute_df["zuerst_gesehen"] = heute
-        neu = heute_df
+    if archive.empty:
+        today_df["zuerst_gesehen"] = today
+        new = today_df
     else:
-        bekannt = archiv.set_index("id")["zuerst_gesehen"]
-        heute_df["zuerst_gesehen"] = heute_df["id"].map(bekannt).fillna(heute)
-        # Inserate, die heute nicht mehr online sind, bleiben unverändert im Archiv
-        nicht_mehr_online = archiv[~archiv["id"].isin(heute_df["id"])]
-        neu = pd.concat([nicht_mehr_online, heute_df], ignore_index=True)
+        known = archive.set_index("id")["zuerst_gesehen"]
+        today_df["zuerst_gesehen"] = today_df["id"].map(known).fillna(today)
+        # Listings that are no longer online today stay unchanged in the archive
+        no_longer_online = archive[~archive["id"].isin(today_df["id"])]
+        new = pd.concat([no_longer_online, today_df], ignore_index=True)
  
-    # 12-Monate-Grenze: was seit über einem Jahr nicht mehr online war, fliegt raus
-    grenze = (date.fromisoformat(heute) - timedelta(days=AUFBEWAHREN_TAGE)).isoformat()
-    neu = neu[neu["zuletzt_gesehen"] >= grenze]
+    # 12-month limit: whatever has not been online for over a year is removed
+    limit = (date.fromisoformat(today) - timedelta(days=KEEP_DAYS)).isoformat()
+    new = new[new["zuletzt_gesehen"] >= limit]
  
-    # Datumsspalten nach vorne, neueste Inserate zuoberst
-    spalten = ["id", "zuerst_gesehen", "zuletzt_gesehen"]
-    neu = neu[spalten + [s for s in neu.columns if s not in spalten]]
-    return neu.sort_values(["zuerst_gesehen", "id"], ascending=False)
+    # Date columns first, newest listings at the top
+    columns = ["id", "zuerst_gesehen", "zuletzt_gesehen"]
+    new = new[columns + [c for c in new.columns if c not in columns]]
+    return new.sort_values(["zuerst_gesehen", "id"], ascending=False)
  
  
 def main():
-    heute = date.today().isoformat()
-    archiv = pd.read_csv(ARCHIV) if os.path.exists(ARCHIV) else pd.DataFrame()
-    if not archiv.empty:
-        # Wohnungen ausserhalb des Kantons entfernen, die früher ins Archiv gerutscht sind
-        grenze = lade_kantonsgrenze()
-        im_kanton = [
-            pd.isna(lat) or pd.isna(lon) or liegt_im_kanton(lon, lat, grenze)
-            for lat, lon in zip(archiv["lat"], archiv["lon"])
+    today = date.today().isoformat()
+    archive = pd.read_csv(ARCHIVE) if os.path.exists(ARCHIVE) else pd.DataFrame()
+    if not archive.empty:
+        # Remove apartments outside the canton that got into the archive earlier
+        border = load_canton_border()
+        in_canton = [
+            pd.isna(lat) or pd.isna(lon) or is_in_canton(lon, lat, border)
+            for lat, lon in zip(archive["lat"], archive["lon"])
         ]
-        archiv = archiv[im_kanton]
-    vorher = len(archiv)
+        archive = archive[in_canton]
+    before = len(archive)
  
-    print("Lade Inserate von Flatfox ...")
-    heute_df = hole_heutige_inserate()
-    if heute_df.empty:
-        # Lieber nichts speichern, als das Archiv mit einer leeren Liste zu überschreiben
-        raise SystemExit("Keine Inserate erhalten, Archiv bleibt unverändert.")
+    print("Loading listings from Flatfox ...")
+    today_df = get_todays_listings()
+    if today_df.empty:
+        # Better to save nothing than to overwrite the archive with an empty list
+        raise SystemExit("No listings received, archive stays unchanged.")
  
-    archiv = aktualisiere_archiv(archiv, heute_df, heute)
-    archiv.to_csv(ARCHIV, index=False)
+    archive = update_archive(archive, today_df, today)
+    archive.to_csv(ARCHIVE, index=False)
  
-    neu = (archiv["zuerst_gesehen"] == heute).sum()
-    print(f"Heute online im Kanton SG: {len(heute_df)} Inserate, davon {neu} neu.")
-    print(f"Archiv: vorher {vorher}, jetzt {len(archiv)} Inserate.")
+    new_count = (archive["zuerst_gesehen"] == today).sum()
+    print(f"Online in the canton of SG today: {len(today_df)} listings, {new_count} of them new.")
+    print(f"Archive: {before} listings before, {len(archive)} now.")
  
  
 if __name__ == "__main__":
     main()
+ 
