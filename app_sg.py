@@ -5,8 +5,7 @@
 # A machine learning model estimates the expected rent. Users can save
 # their rent anonymously (SQLite); averages and model update automatically.
 #
-# Marked with "AI-GENERATED" are the 4 hardest parts, written by the AI
-# (Claude), not by us.
+# Marked with "AI-GENERATED" is written by Claude
 # =====================================================================
 import json
 import sqlite3
